@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"golang.org/x/crypto/ocsp"
 	"io"
 	"io/ioutil"
 	"net"
@@ -283,6 +284,27 @@ func loadKeyPair(keyPath string, certPath string, password string) (*tls.Certifi
 	keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
 	if err != nil {
 		return nil, common.NewError("failed to parse leaf certificate").Base(err)
+	}
+	if len(keyPair.Certificate) > 1 && len(keyPair.Leaf.OCSPServer) > 0 {
+		issuerCert, err := x509.ParseCertificate(keyPair.Certificate[1])
+		if err != nil {
+			return nil, common.NewError("failed to parse issuer certificate").Base(err)
+		}
+
+		ocspReq, err := ocsp.CreateRequest(keyPair.Leaf, issuerCert, nil)
+		body := bytes.NewReader(ocspReq)
+		ocspResp, err := http.Post(keyPair.Leaf.OCSPServer[0], "application/ocsp-request", body)
+		if err != nil || ocspResp.StatusCode != http.StatusOK {
+			return nil, common.NewError("failed to make ocsp request").Base(err)
+		}
+		defer ocspResp.Body.Close()
+
+		keyPair.OCSPStaple, err = io.ReadAll(ocspResp.Body)
+		if err != nil {
+			if err != nil {
+				return nil, common.NewError("failed to read ocsp response").Base(err)
+			}
+		}
 	}
 	return &keyPair, nil
 }
