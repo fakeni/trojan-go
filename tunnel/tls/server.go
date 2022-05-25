@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"golang.org/x/crypto/ocsp"
 	"io"
 	"io/ioutil"
@@ -245,6 +246,13 @@ func (s *Server) checkKeyPairLoop(checkRate time.Duration, keyPath string, certP
 	}
 }
 
+type OCSPData struct {
+	Data []byte
+	Rsp  *ocsp.Response
+}
+
+var ocspMap sync.Map
+
 func loadKeyPair(keyPath string, certPath string, password string) (*tls.Certificate, error) {
 	if password != "" {
 		keyFile, err := ioutil.ReadFile(keyPath)
@@ -286,6 +294,16 @@ func loadKeyPair(keyPath string, certPath string, password string) (*tls.Certifi
 		return nil, common.NewError("failed to parse leaf certificate").Base(err)
 	}
 	if len(keyPair.Certificate) > 1 && len(keyPair.Leaf.OCSPServer) > 0 {
+		ocspDataKey := fmt.Sprintf("%s_%s_%s", keyPath, certPath, password)
+		if v, ok := ocspMap.Load(ocspDataKey); ok {
+			ocspData := v.(*OCSPData)
+			if freshOCSP(ocspData.Rsp) {
+				keyPair.OCSPStaple = ocspData.Data
+			} else {
+				ocspMap.Delete(ocspDataKey)
+			}
+		}
+
 		issuerCert, err := x509.ParseCertificate(keyPair.Certificate[1])
 		if err != nil {
 			return nil, common.NewError("failed to parse issuer certificate").Base(err)
@@ -301,12 +319,32 @@ func loadKeyPair(keyPath string, certPath string, password string) (*tls.Certifi
 
 		keyPair.OCSPStaple, err = io.ReadAll(ocspResp.Body)
 		if err != nil {
-			if err != nil {
-				return nil, common.NewError("failed to read ocsp response").Base(err)
-			}
+			return nil, common.NewError("failed to read ocsp response").Base(err)
+		}
+
+		ocspRsp, err := ocsp.ParseResponse(keyPair.OCSPStaple, issuerCert)
+		if err != nil {
+			return nil, common.NewError("failed to parse ocsp response").Base(err)
+		}
+
+		if ocspRsp.Status == ocsp.Good {
+			ocspMap.Store(ocspDataKey, &OCSPData{keyPair.OCSPStaple, ocspRsp})
 		}
 	}
 	return &keyPair, nil
+}
+
+func freshOCSP(resp *ocsp.Response) bool {
+	nextUpdate := resp.NextUpdate
+	// If there is an OCSP responder certificate, and it expires before the
+	// OCSP response, use its expiration date as the end of the OCSP
+	// response's validity period.
+	if resp.Certificate != nil && resp.Certificate.NotAfter.Before(nextUpdate) {
+		nextUpdate = resp.Certificate.NotAfter
+	}
+	// start checking OCSP staple about halfway through validity period for good measure
+	refreshTime := resp.ThisUpdate.Add(nextUpdate.Sub(resp.ThisUpdate) / 3 * 2)
+	return time.Now().Before(refreshTime)
 }
 
 // NewServer creates a tls layer server
